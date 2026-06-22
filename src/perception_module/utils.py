@@ -166,6 +166,7 @@ class SyncedCameraData:
 
 def depth_image_to_point_cloud(depth_image, camera_intrinsics):
     """Convert depth image to 3D point cloud"""
+    depth_image = np.nan_to_num(depth_image.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
     height, width = depth_image.shape
 
     v, u = np.indices((height, width))
@@ -192,18 +193,39 @@ def statistical_outlier_removal(points_xyz, k=20, std_ratio=2.0):
         mask: Boolean array (N,) where True = valid point
     """
 
-    if len(points_xyz) < k:
-        return np.ones(len(points_xyz), dtype=bool)
+    points_xyz = np.asarray(points_xyz, dtype=float)
+    if points_xyz.ndim != 2 or points_xyz.shape[1] < 3:
+        return np.zeros(len(points_xyz), dtype=bool)
 
-    tree = KDTree(points_xyz)
-    distances, _ = tree.query(points_xyz, k=k+1)  # +1 because it includes the point itself
+    points_xyz = points_xyz[:, :3]
+    finite_mask = np.isfinite(points_xyz).all(axis=1)
+    finite_count = int(np.count_nonzero(finite_mask))
+
+    if finite_count == 0:
+        return finite_mask
+
+    if finite_count < k:
+        return finite_mask
+
+    finite_points = points_xyz[finite_mask]
+    effective_k = min(k, finite_count - 1)
+    if effective_k < 1:
+        return finite_mask
+
+    tree = KDTree(finite_points)
+    distances, _ = tree.query(finite_points, k=effective_k + 1)  # +1 because it includes the point itself
     mean_distances = distances[:, 1:].mean(axis=1)  # Exclude the point itself (distance 0)
 
     global_mean = mean_distances.mean()
     global_std = mean_distances.std()
+    if not np.isfinite(global_mean) or not np.isfinite(global_std) or global_std == 0:
+        return finite_mask
+
     threshold = global_mean + std_ratio * global_std
 
-    mask = mean_distances < threshold
+    finite_result = mean_distances <= threshold
+    mask = np.zeros(len(points_xyz), dtype=bool)
+    mask[np.flatnonzero(finite_mask)] = finite_result
     return mask
 
 def get_distinct_color(index):

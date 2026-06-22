@@ -3,15 +3,15 @@
 Object Manager - Semantic and Spatial Tracking of Perceived Objects
 
 """
-import rclpy, json, os, time, logging, threading
+import rclpy, json, os, logging, re
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, DurabilityPolicy
 import numpy as np
 from openai import OpenAI
-from lost3dsg.msg import ObjectDescriptionArray, Bbox3dArray
+from lost3dsg.msg import ObjectDescription, ObjectDescriptionArray, Bbox3dArray
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Empty
 from object_info import Object
 from debug_utils import TrackingLogger
 from world_model import wm
@@ -28,6 +28,8 @@ EXPLORATION_MODE = True  # Flag to indicate if we are in exploration mode
 SIM_THRESHOLD = 0.75
 TRACKING_IOU_THRESHOLD = 0.3  # IoU threshold to consider objects as "moved" in tracking mode
 VOLUME_EXPANSION_RATIO = 0.01 # 1% expansion relative to object dimensions
+CAR_LABELS = ("car", "vehicle", "truck", "bus", "van")
+CAR_SIM_THRESHOLD = 0.60
 
 
 # Load OpenAI API key
@@ -334,7 +336,9 @@ def save_persistent_perceptions(node):
             "color": obj.color,
             "material": obj.material,
             "shape": obj.shape,
-            "bbox": obj.bbox
+            "bbox": obj.bbox,
+            "motion_state": getattr(obj, "motion_state", "not_applicable"),
+            "crossing_state": getattr(obj, "crossing_state", "not_applicable"),
         })
 
     with open(save_path, "w") as f:
@@ -374,7 +378,9 @@ def save_scene_graph(node, step, is_exploration=False):
             "label": obj.label,
             "color": obj.color,
             "material": obj.material,
-            "bbox": obj.bbox
+            "bbox": obj.bbox,
+            "motion_state": getattr(obj, "motion_state", "not_applicable"),
+            "crossing_state": getattr(obj, "crossing_state", "not_applicable"),
         })
     
     # Save JSON data for better analysis
@@ -384,6 +390,7 @@ def save_scene_graph(node, step, is_exploration=False):
         json.dump({
             "step": step,
             "mode": prefix,
+            "environment": getattr(node, "environment_id", 1),
             "num_objects": len(objects),
             "objects": objects
         }, f, indent=2)
@@ -551,42 +558,361 @@ class ObjectManagerNode(Node):
         self.get_logger().info(f"Log saved in: {log_file}")
 
         # Instance variables
-        self.exploration_mode = True  # Controlled by separate thread
-        self.seen_again = False  # Flag to detect when an object is seen again
+        # Each environment gets one automatic exploration pass. Tracking can
+        # still add previously unseen objects after that pass.
+        self.exploration_mode = True
+        self.environment_id = 1
 
         self.latest_bboxes = {}
         self.latest_fov_volume = None  # FOV volume from depth camera
+        self.declare_parameter("stopped_car_displacement", 0.25)
+        self.declare_parameter("car_state_timeout", 120.0)
+        self.declare_parameter("passed_gap_timeout", 6.0)
+        self.stopped_car_displacement = float(
+            self.get_parameter("stopped_car_displacement").value
+        )
+        self.car_state_timeout = float(
+            self.get_parameter("car_state_timeout").value
+        )
+        self.passed_gap_timeout = float(
+            self.get_parameter("passed_gap_timeout").value
+        )
+        self.last_published_safety = None
+        self.last_scene_summary = None
+        self.car_crossing_tracks = {}
 
         # Uncertain objects list
         self.uncertain_objects = []
 
         qos_latch = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         qos_standard = QoSProfile(depth=10)
-        self.robot_has_moved = False  # Flag to detect if robot has moved at least once
-        self.create_subscription(Bool, "/robot_movement_detected", self.movement_callback, qos_standard)
-
         self.persistent_bbox_pub = self.create_publisher(MarkerArray, '/persistent_bbox', qos_latch)
         self.persistent_centroids_pub = self.create_publisher(MarkerArray, '/persistent_centroids', qos_latch)
         self.considered_volume_pub = self.create_publisher(MarkerArray, '/considered_volume', qos_standard)
         self.uncertain_bboxes_pub = self.create_publisher(MarkerArray, '/uncertain_object', qos_standard)
         self.uncertain_centroids_pub = self.create_publisher(MarkerArray, '/uncertain_centroids', qos_standard)
+        self.scene_graph_pub = self.create_publisher(
+            ObjectDescriptionArray,
+            "/scene_graph/object_descriptions",
+            qos_latch,
+        )
+        self.traffic_safety_pub = self.create_publisher(
+            Bool,
+            "/traffic_scene/safe_to_cross",
+            qos_latch,
+        )
 
         self.create_subscription(Bbox3dArray, "/bbox_3d", self.bbox_callback, qos_standard)
         self.create_subscription(ObjectDescriptionArray, "/object_descriptions", self.description_callback, qos_standard)
+        self.create_subscription(
+            Empty,
+            "/scene_graph/reset_environment",
+            self.reset_environment_callback,
+            qos_standard,
+        )
 
         self._bbox_timer = self.create_timer(2.0, self.periodic_bbox_publisher)
+        self.log_both(
+            'info',
+            "[EXPLORATION] Automatic exploration started for environment 1",
+        )
 
-        exploration_thread = threading.Thread(target=self.wait_for_exploration_end, daemon=True)
-        exploration_thread.start()
+    @staticmethod
+    def _is_car_label(label):
+        label_base = label.lower().split('#')[0].strip()
+        return any(name in label_base.split() for name in CAR_LABELS)
 
-    def movement_callback(self, msg):
-        """Callback to receive robot movement notification from perception."""
-        self.log_both('info', f"[MOVEMENT] Received movement message: {msg.data}")
-        if msg.data and not self.robot_has_moved:
-            self.robot_has_moved = True
-            self.log_both('warn', "[MOVEMENT] ✓ Robot has moved at least once - can now transition to TRACKING")
+    @staticmethod
+    def _canonical_car_label(label, fallback=None):
+        instance_match = re.search(r"#(\d+)", label)
+        if instance_match:
+            return f"car#{instance_match.group(1)}"
+        if fallback:
+            fallback_match = re.search(r"#(\d+)", fallback)
+            if fallback_match:
+                return f"car#{fallback_match.group(1)}"
+        return "car"
+
+    @staticmethod
+    def _is_crosswalk_label(label):
+        return "crosswalk" in label.lower()
+
+    @staticmethod
+    def _is_traffic_light(obj):
+        text = " ".join(
+            (
+                getattr(obj, "label", ""),
+                getattr(obj, "description", ""),
+                getattr(obj, "shape", ""),
+            )
+        ).lower()
+        return "traffic light" in text
+
+    @staticmethod
+    def _bbox_center(bbox):
+        return np.array([
+            (bbox["x_min"] + bbox["x_max"]) / 2.0,
+            (bbox["y_min"] + bbox["y_max"]) / 2.0,
+            (bbox["z_min"] + bbox["z_max"]) / 2.0,
+        ])
+
+    def _update_object_from_observation(
+        self, obj, label, bbox, description, color, material, shape
+    ):
+        if self._is_car_label(label) and obj.bbox is not None:
+            displacement = float(
+                np.linalg.norm(self._bbox_center(bbox) - self._bbox_center(obj.bbox))
+            )
+            obj.motion_state = (
+                "stopped"
+                if displacement <= self.stopped_car_displacement
+                else "moving"
+            )
+            obj.motion_displacement = displacement
+
+        obj.label = (
+            self._canonical_car_label(label, fallback=obj.label)
+            if self._is_car_label(label)
+            else label
+        )
+        obj.bbox = bbox
+        obj.description = description
+        obj.color = color
+        obj.material = material
+        obj.shape = shape
+        obj.last_observed_ns = self.get_clock().now().nanoseconds
+
+    def _initialize_object_observation(self, obj, motion_state="unknown"):
+        if self._is_car_label(obj.label):
+            obj.motion_state = motion_state
+            obj.motion_displacement = None
+        obj.last_observed_ns = self.get_clock().now().nanoseconds
+
+    def _graph_motion_state(self, obj, now_ns):
+        state = getattr(obj, "motion_state", "unknown")
+        last_observed_ns = getattr(obj, "last_observed_ns", None)
+        if last_observed_ns is None:
+            return "unknown"
+        age = (now_ns - last_observed_ns) / 1e9
+        if age > self.car_state_timeout:
+            return "stale"
+        return state
+
+    @staticmethod
+    def _bbox_half_extent_along(bbox, direction):
+        half_x = (bbox["x_max"] - bbox["x_min"]) / 2.0
+        half_y = (bbox["y_max"] - bbox["y_min"]) / 2.0
+        return abs(direction[0]) * half_x + abs(direction[1]) * half_y
+
+    def _car_crossing_state(self, car, crosswalk):
+        """Classify a car as approaching or past the crosswalk."""
+        car_center = self._bbox_center(car.bbox)[:2]
+        crosswalk_center = self._bbox_center(crosswalk.bbox)[:2]
+        relative_position = car_center - crosswalk_center
+        track = self.car_crossing_tracks.setdefault(
+            car.label,
+            {
+                "relative_position": None,
+                "direction": None,
+                "passed": False,
+            },
+        )
+
+        previous_relative = track["relative_position"]
+        if previous_relative is not None:
+            displacement = relative_position - previous_relative
+            car_size = max(
+                car.bbox["x_max"] - car.bbox["x_min"],
+                car.bbox["y_max"] - car.bbox["y_min"],
+                1e-6,
+            )
+            motion_epsilon = 0.2 * car_size
+            displacement_norm = float(np.linalg.norm(displacement))
+            if displacement_norm > motion_epsilon:
+                measured_direction = displacement / displacement_norm
+                old_direction = track["direction"]
+                if old_direction is None:
+                    track["direction"] = measured_direction
+                elif float(np.dot(old_direction, measured_direction)) >= 0.0:
+                    smoothed = 0.7 * old_direction + 0.3 * measured_direction
+                    smoothed_norm = float(np.linalg.norm(smoothed))
+                    if smoothed_norm > 0.0:
+                        track["direction"] = smoothed / smoothed_norm
+                elif displacement_norm > 3.0 * car_size:
+                    # A large opposite jump means that the simulated car
+                    # wrapped around and is approaching on a new pass.
+                    track["direction"] = measured_direction
+                    track["passed"] = False
+
+        track["relative_position"] = relative_position
+        track["last_observed_ns"] = getattr(
+            car,
+            "last_observed_ns",
+            self.get_clock().now().nanoseconds,
+        )
+        direction = track["direction"]
+        if direction is None:
+            car.crossing_state = "unknown_direction"
+            return car.crossing_state
+
+        clearance = (
+            self._bbox_half_extent_along(crosswalk.bbox, direction)
+            + self._bbox_half_extent_along(car.bbox, direction)
+        )
+        progress = float(np.dot(relative_position, direction))
+        if progress > clearance:
+            track["passed"] = True
+        elif progress < -clearance:
+            track["passed"] = False
+
+        car.crossing_state = "passed" if track["passed"] else "approaching"
+        return car.crossing_state
+
+    def _second_road_is_clear(self, cars, crosswalks):
+        if not crosswalks or (not cars and not self.car_crossing_tracks):
+            return False, ["missing_crosswalk_or_car"]
+
+        # Use the detected crosswalk nearest to the observed cars. Normally
+        # the second environment contains exactly one crosswalk.
+        crosswalk = min(
+            crosswalks,
+            key=lambda candidate: sum(
+                np.linalg.norm(
+                    self._bbox_center(car.bbox)[:2]
+                    - self._bbox_center(candidate.bbox)[:2]
+                )
+                for car in cars
+            ),
+        )
+        now_ns = self.get_clock().now().nanoseconds
+        states = []
+        observed_labels = set()
+        for car in cars:
+            observed_labels.add(car.label)
+            if self._graph_motion_state(car, now_ns) == "stale":
+                car.crossing_state = "stale"
+                states.append(car.crossing_state)
+            else:
+                states.append(self._car_crossing_state(car, crosswalk))
+
+        # Preserve a short safe gap when a car was last observed fully past
+        # the crosswalk and then left the camera view.
+        for label, track in self.car_crossing_tracks.items():
+            if label in observed_labels:
+                continue
+            last_observed_ns = track.get("last_observed_ns")
+            age = (
+                (now_ns - last_observed_ns) / 1e9
+                if last_observed_ns is not None
+                else float("inf")
+            )
+            if track["passed"] and age <= self.passed_gap_timeout:
+                states.append("passed")
+            else:
+                states.append("missing_or_stale")
+        return all(state == "passed" for state in states), states
+
+    def publish_scene_graph_state(self):
+        """Publish the semantic graph and a conservative crossing decision."""
+        now = self.get_clock().now()
+        graph_message = ObjectDescriptionArray()
+        graph_message.header.stamp = now.to_msg()
+        graph_message.header.frame_id = "map"
+
+        green_light_seen = False
+        car_states = []
+        cars = [
+            obj
+            for obj in wm.persistent_perceptions
+            if self._is_car_label(obj.label) and obj.bbox is not None
+        ]
+        crosswalks = [
+            obj
+            for obj in wm.persistent_perceptions
+            if "crosswalk" in obj.label.lower() and obj.bbox is not None
+        ]
+        crossing_states = []
+        if self.environment_id >= 2:
+            safe_to_cross, crossing_states = self._second_road_is_clear(
+                cars,
+                crosswalks,
+            )
         else:
-            self.log_both('info', f"[MOVEMENT] robot_has_moved already set to: {self.robot_has_moved}")
+            safe_to_cross = False
+
+        for obj in wm.persistent_perceptions:
+            description = ObjectDescription()
+            description.label = obj.label
+            description.description = obj.description
+            description.color = obj.color
+            description.material = obj.material
+            description.shape = obj.shape
+
+            text = " ".join(
+                (obj.label, obj.description, obj.color, obj.shape)
+            ).lower()
+            if "traffic light" in text and "green" in text:
+                green_light_seen = True
+
+            if self._is_car_label(obj.label):
+                motion_state = self._graph_motion_state(obj, now.nanoseconds)
+                car_states.append(motion_state)
+                motion_text = f"motion_state={motion_state}"
+                if description.description:
+                    description.description += f"; {motion_text}"
+                else:
+                    description.description = motion_text
+                crossing_state = getattr(obj, "crossing_state", "not_applicable")
+                if self.environment_id >= 2:
+                    description.description += (
+                        f"; crossing_state={crossing_state}"
+                    )
+
+            graph_message.descriptions.append(description)
+
+        # On the signalized first road, require every observed car to be
+        # stopped. The second-road decision was computed from crossing states.
+        if self.environment_id == 1:
+            safe_to_cross = bool(car_states) and all(
+                state == "stopped" for state in car_states
+            )
+        self.scene_graph_pub.publish(graph_message)
+        self.traffic_safety_pub.publish(Bool(data=safe_to_cross))
+
+        scene_summary = (
+            safe_to_cross,
+            self.environment_id,
+            tuple(car_states),
+            tuple(crossing_states),
+        )
+        if scene_summary != self.last_scene_summary:
+            self.last_published_safety = safe_to_cross
+            self.last_scene_summary = scene_summary
+            self.log_both(
+                'info',
+                "[SCENE GRAPH] safe_to_cross="
+                f"{safe_to_cross}, environment={self.environment_id}, "
+                f"green_light={green_light_seen}, car_states={car_states}, "
+                f"crossing_states={crossing_states}",
+            )
+
+    def reset_environment_callback(self, _msg):
+        """Discard the previous road graph and explore the new road once."""
+        self.environment_id += 1
+        self.exploration_mode = True
+        wm.persistent_perceptions.clear()
+        self.uncertain_objects.clear()
+        self.latest_bboxes.clear()
+        self.latest_fov_volume = None
+        self.last_published_safety = None
+        self.last_scene_summary = None
+        self.car_crossing_tracks.clear()
+        self.log_both(
+            'warn',
+            "[EXPLORATION] Environment reset received; automatic exploration "
+            f"started for environment {self.environment_id}",
+        )
+        self.publish_scene_graph_state()
 
 
     def log_both(self, level, message):
@@ -616,34 +942,6 @@ class ObjectManagerNode(Node):
             print(f"{prefix}{message}")
 
 
-    def wait_for_exploration_end(self):
-
-        self.log_both('warn', "=" * 60)
-        self.log_both('warn', "[EXPLORATION] The robot is in EXPLORATION.")
-        self.log_both('warn', "[EXPLORATION] Will switch to TRACKING when an object is seen again.")
-        self.log_both('warn', "=" * 60)
-
-        # Wait until an object is seen again
-        while not self.seen_again:
-            choice = input("Click ENTER to stop exploration and switch to TRACKING mode...\n")
-            if choice == "":
-                self.seen_again = True
-                self.log_both('warn', "[EXPLORATION] Manual interruption received - switching to TRACKING mode...")
-                break
-            time.sleep(0.1)  # Check every 100ms
-
-        self.log_both('warn', "=" * 60)
-        self.log_both('warn', "[EXPLORATION] Exploration phase ENDED!")
-        self.log_both('warn', "[EXPLORATION] An object has been SEEN AGAIN - switching to TRACKING")
-        self.log_both('warn', "[TRACKING] Tracking mode ACTIVATED")
-        self.log_both('warn', "=" * 60)
-        print("\n\n\n")
-
-        self.exploration_mode = False
-
-        publish_persistent_bboxes(self, wm, self.persistent_bbox_pub)
-        publish_persistent_centroids(self, wm, self.persistent_centroids_pub)
-
     def description_callback(self, msg):
         if not hasattr(self, 'tracking_step_counter'):
             self.tracking_step_counter = 0
@@ -671,6 +969,7 @@ class ObjectManagerNode(Node):
             color = description.color
             material = description.material
             description_text = description.description
+            shape = description.shape
 
             print(f"1. Calculating embedding for description...")
             description_embedding = get_embedding(client, description_text)
@@ -710,6 +1009,10 @@ class ObjectManagerNode(Node):
             if in_exploration:
                 print(f"3. [EXPLORATION] Comparing with {len(wm.persistent_perceptions)} persistent objects using lost_similarity...")
                 for obj in wm.persistent_perceptions:
+                    if self._is_car_label(label) != self._is_car_label(obj.label):
+                        continue
+                    if self._is_crosswalk_label(label) != self._is_crosswalk_label(obj.label):
+                        continue
                     # Use lost_similarity
                     obj_label_base = obj.label.split('#')[0] if '#' in obj.label else obj.label
                     similarity = lost_similarity(
@@ -720,7 +1023,14 @@ class ObjectManagerNode(Node):
                         description_embedding, obj.embedding
                     )
                     print("Comparing with persistent object:", obj.label)
-                    if similarity > SIM_THRESHOLD:
+                    same_physical_traffic_light = (
+                        "traffic light" in label.lower()
+                        and self._is_traffic_light(obj)
+                        and obj.bbox is not None
+                        and compute_iou_3d(bbox, obj.bbox)
+                        >= EXPLORATION_IOU_THRESHOLD
+                    )
+                    if similarity > SIM_THRESHOLD or same_physical_traffic_light:
                         print(f"Semantic match! Calculating spatial IoU...")
                         if obj.bbox is not None:
                             iou = compute_iou_3d(bbox, obj.bbox)
@@ -733,16 +1043,16 @@ class ObjectManagerNode(Node):
                                 # Equal object found in the same position
                                 already_seen = True
                                 current_perception_objects.append(obj)
-                                obj.bbox = bbox
+                                self._update_object_from_observation(
+                                    obj,
+                                    label,
+                                    bbox,
+                                    description_text,
+                                    color,
+                                    material,
+                                    shape,
+                                )
                                 print(f"FULL MATCH! '{label}' = '{obj.label}' (lost_sim={similarity:.3f}, IoU={iou:.3f})")
-                                # Set flag to trigger transition to tracking (I have seen an object again AND robot has moved at least once)
-                                if not self.seen_again:
-                                    if self.robot_has_moved:
-                                        self.seen_again = True
-                                        self.log_both('warn', f"[EXPLORATION] ✓ Object '{label}' seen again! Robot has moved. Switching to TRACKING...")
-                                    else:
-                                        self.log_both('warn', f"[EXPLORATION] Object '{label}' seen again, but robot hasn't moved yet. Waiting for movement...")
-
                                 break
 
             # ======== Tracking ========
@@ -754,8 +1064,13 @@ class ObjectManagerNode(Node):
                 print(f"4. [FIX] Semantic matching among ALL persistent objects ({len(wm.persistent_perceptions)} objects)...")
                 best_match = None
                 best_score = 0
+                best_spatial_iou = -1.0
 
                 for obj in wm.persistent_perceptions:
+                    if self._is_car_label(label) != self._is_car_label(obj.label):
+                        continue
+                    if self._is_crosswalk_label(label) != self._is_crosswalk_label(obj.label):
+                        continue
                     if not hasattr(obj, "embedding"):
                         obj.embedding = get_embedding(client, obj.description)
 
@@ -775,9 +1090,43 @@ class ObjectManagerNode(Node):
                     # FIX: Indicate whether the object is inside the search volume
                     is_in_volume = bbox_intersects_volume(obj.bbox, search_volume) if obj.bbox else False
                     print(f"      - Object bbox intersects search volume: {is_in_volume}")
+                    spatial_iou = (
+                        compute_iou_3d(bbox, obj.bbox)
+                        if obj.bbox is not None
+                        else 0.0
+                    )
 
-                    if similarity > SIM_THRESHOLD and similarity > best_score:
-                        best_score = similarity
+                    same_physical_traffic_light = (
+                        "traffic light" in label.lower()
+                        and self._is_traffic_light(obj)
+                        and obj.bbox is not None
+                        and compute_iou_3d(bbox, obj.bbox)
+                        >= TRACKING_IOU_THRESHOLD
+                    )
+                    candidate_score = (
+                        1.0 if same_physical_traffic_light else similarity
+                    )
+                    car_identity_match = (
+                        self._is_car_label(label)
+                        and self._is_car_label(obj.label)
+                        and similarity > CAR_SIM_THRESHOLD
+                    )
+                    if (
+                        (
+                            similarity > SIM_THRESHOLD
+                            or same_physical_traffic_light
+                            or car_identity_match
+                        )
+                        and (
+                            candidate_score > best_score
+                            or (
+                                abs(candidate_score - best_score) < 1e-6
+                                and spatial_iou > best_spatial_iou
+                            )
+                        )
+                    ):
+                        best_score = candidate_score
+                        best_spatial_iou = spatial_iou
                         best_match = obj
 
                 # If match found, update
@@ -805,7 +1154,15 @@ class ObjectManagerNode(Node):
                             new_z = (bbox['z_min'] + bbox['z_max']) / 2.0
 
 
-                        best_match.bbox = bbox
+                        self._update_object_from_observation(
+                            best_match,
+                            label,
+                            bbox,
+                            description_text,
+                            color,
+                            material,
+                            shape,
+                        )
                         current_perception_objects.append(best_match)
                         objects_modified = True
                         
@@ -850,11 +1207,31 @@ class ObjectManagerNode(Node):
                             print(f"{best_match.label} NOT added to UNCERTAIN_OBJECTS (movement={distance:.3f}m ≤ 0.8m)\n")
 
                         # Create new object with new position
-                        updated_obj = Object(label, None, bbox, description_text, color, material)
+                        updated_label = (
+                            self._canonical_car_label(
+                                label,
+                                fallback=best_match.label,
+                            )
+                            if self._is_car_label(label)
+                            else label
+                        )
+                        updated_obj = Object(
+                            updated_label,
+                            None,
+                            bbox,
+                            description_text,
+                            color,
+                            material,
+                            shape,
+                        )
                         updated_obj.embedding = description_embedding
+                        self._initialize_object_observation(
+                            updated_obj,
+                            motion_state="moving",
+                        )
                         wm.persistent_perceptions.append(updated_obj)
                         current_perception_objects.append(updated_obj)
-                        print(f"MODIFICATION: '{label}' reinserted with new position in persistent_perceptions")
+                        print(f"MODIFICATION: '{updated_label}' reinserted with new position in persistent_perceptions")
                         
                         # Log position change
                         if not in_exploration:
@@ -870,8 +1247,22 @@ class ObjectManagerNode(Node):
             if not already_seen:
                 print(f"\nNEW OBJECT DETECTED!")
                 # Create the new object
-                new_obj = Object(label, None, bbox, description_text, color, material)
+                new_label = (
+                    self._canonical_car_label(label)
+                    if self._is_car_label(label)
+                    else label
+                )
+                new_obj = Object(
+                    new_label,
+                    None,
+                    bbox,
+                    description_text,
+                    color,
+                    material,
+                    shape,
+                )
                 new_obj.embedding = description_embedding
+                self._initialize_object_observation(new_obj)
 
                 # Always add to persistent_perceptions (GREEN bbox)
                 wm.persistent_perceptions.append(new_obj)
@@ -885,7 +1276,7 @@ class ObjectManagerNode(Node):
                 volume = x_size * y_size * z_size
 
                 mode_tag = "[EXPLORATION]" if in_exploration else f"[TRACKING STEP {self.tracking_step_counter}]"
-                print(f"{mode_tag} New object '{label}' added to persistent_perceptions (bbox volume: {volume:.3f} m³)")
+                print(f"{mode_tag} New object '{new_label}' added to persistent_perceptions (bbox volume: {volume:.3f} m³)")
                 
                 # Log new object addition
                 if not in_exploration:
@@ -992,12 +1383,26 @@ class ObjectManagerNode(Node):
                 else:
                     print(f"No uncertain object present")
 
+        if in_exploration and current_perception_objects:
+            self.exploration_mode = False
+            self.log_both(
+                'warn',
+                "[EXPLORATION] Initial graph pass complete for environment "
+                f"{self.environment_id}; TRACKING activated automatically",
+            )
+            publish_persistent_bboxes(self, wm, self.persistent_bbox_pub)
+            publish_persistent_centroids(self, wm, self.persistent_centroids_pub)
+
         if objects_modified and not in_exploration:
             publish_persistent_bboxes(self, wm, self.persistent_bbox_pub)
             publish_persistent_centroids(self, wm, self.persistent_centroids_pub)
             publish_uncertain_bboxes(self, self.uncertain_objects, self.uncertain_bboxes_pub)
             publish_uncertain_centroids(self, self.uncertain_objects, self.uncertain_centroids_pub)
             save_uncertain_objects(self)
+
+        # Compute motion/crossing states before serializing the graph so the
+        # JSON snapshot contains the current decision evidence.
+        self.publish_scene_graph_state()
 
         # Save scene graph for this tracking step
         if not in_exploration:
@@ -1080,6 +1485,10 @@ class ObjectManagerNode(Node):
                 publish_uncertain_bboxes(self, self.uncertain_objects, self.uncertain_bboxes_pub)
                 publish_uncertain_centroids(self, self.uncertain_objects, self.uncertain_centroids_pub)
                 save_uncertain_objects(self)
+
+        # The controller consumes this semantic snapshot. Publish it in both
+        # exploration and tracking modes so its freshness timeout remains valid.
+        self.publish_scene_graph_state()
 
 
 def main(args=None):

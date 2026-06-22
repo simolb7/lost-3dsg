@@ -204,7 +204,7 @@ class DetectObjects(Node):
         self.time_stationary_start = None  
         self.last_detection_time = None 
         self.first_detection_done = False  
-        self.min_stationary_after_movement = 6.0  
+        self.min_stationary_after_movement = 2.0
 
         # USED DURING TEST PHASE
         self.manual_trigger_requested = False
@@ -240,6 +240,40 @@ class DetectObjects(Node):
 
         # Clear accumulated markers
         self.clear_accumulated_markers()
+
+    def _publish_fast_traffic_light_labels(self, labels) -> None:
+        traffic_light_labels = [
+            label.strip().lower()
+            for label in labels
+            if "traffic light" in label.lower()
+        ]
+        if not traffic_light_labels:
+            return
+
+        msg = ObjectDescriptionArray()
+        msg.header = Header(stamp=self.get_clock().now().to_msg(), frame_id="map")
+
+        for label in traffic_light_labels:
+            description = ObjectDescription()
+            description.label = label
+            description.description = label
+            if "green" in label:
+                description.color = "green"
+            elif "red" in label:
+                description.color = "red"
+            elif "yellow" in label:
+                description.color = "yellow"
+            else:
+                description.color = "unknown"
+            description.material = "unknown"
+            description.shape = "traffic light"
+            msg.descriptions.append(description)
+
+        self.pub_object_descriptions.publish(msg)
+        self.log_both(
+            "info",
+            f"Fast traffic-light perception published: {traffic_light_labels}",
+        )
 
     def log_both(self, level, message):
         # Log on ROS
@@ -365,6 +399,7 @@ class DetectObjects(Node):
             labels.append(label.strip())
 
         self.log_both("info", f"Parsed labels ({len(labels)} objects): {labels}")
+        self._publish_fast_traffic_light_labels(labels)
 
         self.detector.set_classes(labels)
 
@@ -561,7 +596,8 @@ class DetectObjects(Node):
         depth_viz_dir = os.path.join(viz_output_dir, "depth")
         os.makedirs(depth_viz_dir, exist_ok=True)
         # Normalize depth for visualization
-        depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
+        depth_for_viz = np.nan_to_num(depth.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        depth_normalized = cv2.normalize(depth_for_viz, None, 0, 255, cv2.NORM_MINMAX)
         depth_colored = cv2.applyColorMap(depth_normalized.astype(np.uint8), cv2.COLORMAP_JET)
         depth_viz_path = os.path.join(depth_viz_dir, f"depth_{timestamp_str}.jpg")
         cv2.imwrite(depth_viz_path, depth_colored)
@@ -941,7 +977,7 @@ def main(args=None):
         else:
             print(f"DEBUG: Skipping re-detection - is_stationary={node.is_stationary}, time_stationary_start={'None' if node.time_stationary_start is None else 'set'}")
 
-    _timer = node.create_timer(0.5, timer_callback)  
+    _timer = node.create_timer(0.2, timer_callback)
 
     try:
         rclpy.spin(node)

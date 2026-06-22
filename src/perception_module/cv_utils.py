@@ -170,7 +170,7 @@ def mask_list_to_pointcloud2(masks, depth_image, camera_info, node, labels=None,
         depth_values = []
         for x, y in zip(xs, ys):
             z = float(depth_image[y, x])
-            if z > 0 and not np.isnan(z):
+            if z > 0 and np.isfinite(z):
                 depth_values.append(z)
 
         node.get_logger().info(f"  Mask {obj_idx}: {len(depth_values)} valid depth points out of {len(xs)}")
@@ -199,7 +199,7 @@ def mask_list_to_pointcloud2(masks, depth_image, camera_info, node, labels=None,
         filtered_count = 0
         for x, y in zip(xs, ys):
             z = float(depth_image[y, x])
-            if z <= 0 or np.isnan(z):
+            if z <= 0 or not np.isfinite(z):
                 continue
 
             # Filter anomalous depth
@@ -214,6 +214,14 @@ def mask_list_to_pointcloud2(masks, depth_image, camera_info, node, labels=None,
 
         if filtered_count > 0:
             node.get_logger().info(f"Obj {obj_idx}: pre-filtered {filtered_count} points with anomalous depth") 
+
+        if len(points) == 0:
+            continue
+
+        finite_points = [point for point in points if np.isfinite(point[:3]).all()]
+        if len(finite_points) != len(points):
+            node.get_logger().warn(f"Obj {obj_idx}: dropped {len(points) - len(finite_points)} non-finite 3D points")
+            points = finite_points
 
         if len(points) == 0:
             continue
@@ -270,13 +278,17 @@ def mask_list_to_pointcloud2(masks, depth_image, camera_info, node, labels=None,
             # Transform point from camera frame to map frame
             try:
                 point_in_map = _transform_point_xyz((x, y, z), camera_frame, "map", node=node)
-                points_with_unique_id.append((
+                transformed_point = (
                     float(point_in_map[0]),
                     float(point_in_map[1]),
                     float(point_in_map[2]),
                     rgb_packed,  # Use the color based on unique_obj_id
                     unique_obj_id
-                ))
+                )
+                if np.isfinite(transformed_point[:4]).all():
+                    points_with_unique_id.append(transformed_point)
+                else:
+                    node.get_logger().warn(f"Skipped non-finite transformed point for object {obj_idx}")
             except Exception as e:
                 node.get_logger().warn(f"Failed to transform point ({x}, {y}, {z}) to map frame: {e}")
                 continue
@@ -297,7 +309,13 @@ def mask_list_to_pointcloud2(masks, depth_image, camera_info, node, labels=None,
     # PUBLISH ONLY CURRENT FRAME (no accumulation)
     # This prevents color overlapping when revisiting the same scene
     # ============================================
-    points_to_publish = current_points
+    points_to_publish = [point for point in current_points if np.isfinite(point[:4]).all()]
+    dropped_nonfinite = len(current_points) - len(points_to_publish)
+    if dropped_nonfinite > 0:
+        node.get_logger().warn(f"mask_list_to_pointcloud2: dropped {dropped_nonfinite} non-finite points before publishing")
+    if len(points_to_publish) == 0:
+        node.get_logger().warn("mask_list_to_pointcloud2: all points were non-finite, nothing to publish")
+        return
     labels_to_publish = id_to_label
 
     node.get_logger().info(f"=== Publishing {len(points_to_publish)} points from {len(labels_to_publish)} objects (current frame only) ===")
@@ -408,7 +426,7 @@ def publish_individual_pointclouds_by_id(masks, depth_image, camera_info, node, 
         depth_values = []
         for x, y in zip(xs, ys):
             z = float(depth_image[y, x])
-            if z > 0 and not np.isnan(z):
+            if z > 0 and np.isfinite(z):
                 depth_values.append(z)
 
         if len(depth_values) == 0:
@@ -433,7 +451,7 @@ def publish_individual_pointclouds_by_id(masks, depth_image, camera_info, node, 
 
         for x, y in zip(xs, ys):
             z = float(depth_image[y, x])
-            if z <= 0 or np.isnan(z):
+            if z <= 0 or not np.isfinite(z):
                 continue
 
             if z < depth_min or z > depth_max:
@@ -461,6 +479,14 @@ def publish_individual_pointclouds_by_id(masks, depth_image, camera_info, node, 
 
         if filtered_count > 0:
             node.get_logger().info(f"Obj {obj_id}: pre-filtered {filtered_count} points with anomalous depth")  # ROS2_MIGRATION
+
+        if len(points) == 0:
+            continue
+
+        finite_points = [point for point in points if np.isfinite(point[:4]).all()]
+        if len(finite_points) != len(points):
+            node.get_logger().warn(f"Obj {obj_id}: dropped {len(points) - len(finite_points)} non-finite 3D points")
+            points = finite_points
 
         if len(points) == 0:
             continue
@@ -501,6 +527,11 @@ def publish_individual_pointclouds_by_id(masks, depth_image, camera_info, node, 
         header = Header()
         header.stamp = timestamp if timestamp is not None else node.get_clock().now().to_msg()
         header.frame_id = frame_id
+
+        points = [point for point in points if np.isfinite(point[:4]).all()]
+        if len(points) == 0:
+            node.get_logger().warn(f"Object {obj_idx} ({labels[obj_idx]}): no finite points left before publishing!")
+            continue
 
         cloud_msg = point_cloud2.create_cloud(header, fields, points)
         label_sanitized = labels[obj_idx].replace(' ', '_').replace('-', '_')
@@ -668,7 +699,7 @@ def mask_list_to_centroid_and_bbox(mask_list, labels, depth_image, camera_info, 
         depth_values = []
         for x, y in zip(xs, ys):
             z = float(depth_image[y, x])
-            if z > 0 and not np.isnan(z):
+            if z > 0 and np.isfinite(z):
                 depth_values.append(z)
 
         if len(depth_values) == 0:
@@ -692,7 +723,7 @@ def mask_list_to_centroid_and_bbox(mask_list, labels, depth_image, camera_info, 
         points_3d = []
         for x, y in zip(xs, ys):
             z = float(depth_image[y, x])
-            if z <= 0 or np.isnan(z):
+            if z <= 0 or not np.isfinite(z):
                 continue
             if z < depth_min or z > depth_max:
                 continue  # Anomalous depth, skip
@@ -708,6 +739,16 @@ def mask_list_to_centroid_and_bbox(mask_list, labels, depth_image, camera_info, 
             continue
 
         points_3d = np.array(points_3d)
+        finite_mask = np.isfinite(points_3d).all(axis=1)
+        if not np.all(finite_mask):
+            node.file_logger.warning(f"Mask {mask_idx}: removed {np.sum(~finite_mask)} non-finite 3D points before outlier filtering")
+            points_3d = points_3d[finite_mask]
+
+        if len(points_3d) == 0:
+            node.file_logger.warning(f"Mask {mask_idx}: discarded - no finite 3D points after depth conversion")
+            centroids_3d.append(None)
+            bboxes_3d.append(None)
+            continue
 
         # ============================================
         # APPLY OUTLIER FILTERING IF REQUESTED

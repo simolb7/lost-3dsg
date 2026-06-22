@@ -4,6 +4,11 @@ Do NOT include objects that are in the background or partially visible. If you s
 IMPORTANT: Use ONLY ONE WORD per object - use the most common, simple name. NO compound words, NO adjectives, NO descriptions.
 Examples: 'bottle' NOT 'water bottle', 'chair' NOT 'office chair', 'plant' NOT 'potted plant', 'laptop' NOT 'gaming laptop'.
 
+CRITICAL FOR ROAD SCENES: Treat a zebra crossing and all of its painted stripes as ONE object named exactly 'crosswalk'. Never output individual objects such as 'stripe', 'bar', or 'line' for crosswalk markings.
+
+CRITICAL EXCEPTION FOR TRAFFIC LIGHTS: If you see a traffic light, you MUST output its current state using exactly these phrases: 'red traffic light', 'green traffic light', or 'yellow traffic light'. This is the ONLY exception to the single-word rule.
+
+CRITICAL: If you see a traffic light box, pole-mounted light, or pedestrian signal, do NOT label it as 'sign'. You MUST label it as 'traffic light' (and include its current color state as instructed above).
 Exclude irrelevant objects such as walls, stickers, or background items. 
-Example: plant, screwdriver, wrench, hammer, can, bottle, chair, table. 
+Example: plant, screwdriver, wrench, car, person.
 Do not add any other text, only the list of objects.
